@@ -397,8 +397,8 @@ def build_notes_lines(
 # Streamlit App
 # ----------------------------
 
-st.set_page_config(page_title="Cumulative Return Viewer", layout="wide")
-st.title("Cumulative Return Viewer (Yahoo)")
+st.set_page_config(page_title="Yahoo! Charts", layout="wide")
+st.title("Yahoo! Charts")
 
 with st.sidebar:
     st.header("Tickers")
@@ -585,3 +585,4 @@ notes = build_notes_lines(
 )
 for line in notes:
     st.write(f"- {line}")
+
