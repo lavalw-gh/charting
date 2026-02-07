@@ -43,6 +43,12 @@ def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tu
         return today - timedelta(days=730), today
     if preset == "Last 36 months":
         return today - timedelta(days=1095), today
+    if preset == "Last 5 yrs":
+        return today - timedelta(days=1826), today
+    if preset == "Last 10 yrs":
+        return today - timedelta(days=3653), today
+    if preset == "Last 20 yrs":
+        return today - timedelta(days=7305), today
     return start_custom, end_custom
 
 
@@ -417,7 +423,7 @@ with st.sidebar:
     date_preset = st.selectbox(
         "Date range",
         ["Custom", "Last 3 months", "Last 6 months", "YTD",
-            "Last 12 months", "Last 24 months", "Last 36 months"],
+            "Last 12 months", "Last 24 months", "Last 36 months", "Last 5 yrs", "Last 10 yrs", "Last 20 yrs"],
         index=4,
     )
 
@@ -585,4 +591,5 @@ notes = build_notes_lines(
 )
 for line in notes:
     st.write(f"- {line}")
+
 
