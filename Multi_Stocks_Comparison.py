@@ -7,10 +7,11 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-#version 2 - added Max Range
+# version 2 - max date range
 # ----------------------------
 # Parsing / settings helpers
 # ----------------------------
+
 
 def parse_ticker_lines(raw: str) -> list[str]:
     lines = [ln.strip() for ln in (raw or "").splitlines()]
@@ -23,6 +24,7 @@ def parse_ticker_lines(raw: str) -> list[str]:
             seen.add(t)
             out.append(t)
     return out
+
 
 def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tuple[date, date]:
     today = date.today()
@@ -51,12 +53,14 @@ def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tu
         return date(1900, 1, 1), today
     return start_custom, end_custom
 
+
 def fmt_d(d: date) -> str:
     return d.strftime("%d/%m/%Y")
 
 # ----------------------------
 # Yahoo metadata + currency
 # ----------------------------
+
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def get_symbol_meta(symbol: str) -> dict:
@@ -81,6 +85,7 @@ def get_symbol_meta(symbol: str) -> dict:
         meta["name"] = None
     return meta
 
+
 def currency_factor_to_major_units(yahoo_currency: str | None) -> tuple[float, str]:
     """
     Convert Yahoo 'GBp'/'GBX' (pence) into pounds-equivalent major units.
@@ -97,6 +102,7 @@ def currency_factor_to_major_units(yahoo_currency: str | None) -> tuple[float, s
 # ----------------------------
 # Yahoo download (Close only)
 # ----------------------------
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.DataFrame, list[dict]]:
@@ -158,6 +164,7 @@ def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.Da
 # Max date range determination
 # ----------------------------
 
+
 def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | None]:
     """
     Fetch maximum available history for all symbols and find the latest
@@ -166,12 +173,12 @@ def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | N
     """
     if not symbols:
         return None, None
-    
+
     # Fetch from a very early date to get all available history
     early_start = date(1990, 1, 1)
     today = date.today()
     end_plus = today + timedelta(days=1)
-    
+
     try:
         data = yf.download(
             symbols,
@@ -181,10 +188,10 @@ def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | N
             progress=False,
             group_by="column",
         )
-        
+
         if data is None or getattr(data, "empty", True):
             return None, None
-        
+
         # Extract Close prices
         if isinstance(data.columns, pd.MultiIndex):
             if "Close" not in data.columns.get_level_values(0):
@@ -199,7 +206,7 @@ def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | N
                 close.columns = [symbols[0]]
             else:
                 return None, None
-        
+
         # Find first valid date for each symbol
         first_dates = {}
         for sym in symbols:
@@ -207,22 +214,23 @@ def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | N
                 first_valid = close[sym].first_valid_index()
                 if first_valid is not None:
                     first_dates[sym] = pd.to_datetime(first_valid).date()
-        
+
         if not first_dates:
             return None, None
-        
+
         # The max (latest) first date is our common start
         limiting_symbol = max(first_dates, key=first_dates.get)
         common_start = first_dates[limiting_symbol]
-        
+
         return common_start, limiting_symbol
-        
+
     except Exception:
         return None, None
 
 # ----------------------------
 # Missing-history handling
 # ----------------------------
+
 
 def backfill_leading_flat(close: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     """
@@ -272,6 +280,7 @@ def backfill_leading_flat(close: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]
 # ----------------------------
 # Spike cleaning
 # ----------------------------
+
 
 def clean_daily_spikes_flat(
     close: pd.DataFrame,
@@ -327,6 +336,7 @@ def clean_daily_spikes_flat(
 # Transformations for charting
 # ----------------------------
 
+
 def compute_rebased_index(close: pd.DataFrame, base_value: float = 100.0) -> pd.DataFrame:
     out = {}
     for c in close.columns:
@@ -337,6 +347,7 @@ def compute_rebased_index(close: pd.DataFrame, base_value: float = 100.0) -> pd.
     if not out:
         return pd.DataFrame()
     return pd.DataFrame(out).sort_index()
+
 
 def compute_cum_return(close: pd.DataFrame) -> pd.DataFrame:
     out = {}
@@ -353,6 +364,7 @@ def compute_cum_return(close: pd.DataFrame) -> pd.DataFrame:
 # Plot + export
 # ----------------------------
 
+
 def plot_lines(df: pd.DataFrame, title: str, y_label: str, percent: bool) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(11, 5.5))
     for col in df.columns:
@@ -365,6 +377,7 @@ def plot_lines(df: pd.DataFrame, title: str, y_label: str, percent: bool) -> plt
     fig.autofmt_xdate()
     return fig
 
+
 def fig_to_png_bytes(fig: plt.Figure) -> bytes:
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
@@ -375,6 +388,7 @@ def fig_to_png_bytes(fig: plt.Figure) -> bytes:
 # ----------------------------
 # Notes generation
 # ----------------------------
+
 
 def build_notes_lines(
     start_date: date,
@@ -389,7 +403,7 @@ def build_notes_lines(
     Returns a list of human-readable note lines to display under the chart.
     """
     lines: list[str] = []
-    
+
     # Max mode note (if applicable)
     is_max_mode, limiting_symbol = max_mode_info
     if is_max_mode and limiting_symbol:
@@ -457,6 +471,7 @@ def build_notes_lines(
 # Streamlit App
 # ----------------------------
 
+
 st.set_page_config(page_title="Yahoo! Charts", layout="wide")
 st.title("Yahoo! Charts")
 
@@ -514,7 +529,7 @@ with st.sidebar:
     run = st.button("Update chart", type="primary")
 
 if not run:
-    st.info("Enter tickers on the left, adjust settings, then click "Update chart".")
+    st.info('Enter tickers on the left, adjust settings, then click "Update chart".')
     st.stop()
 
 tickers = parse_ticker_lines(raw_tickers)
@@ -537,7 +552,8 @@ if is_max_mode:
     with st.spinner("Calculating maximum common date range..."):
         common_start, limiting_symbol = find_max_common_start_date(symbols)
         if common_start is None:
-            st.error("Unable to determine maximum date range for the provided symbols.")
+            st.error(
+                "Unable to determine maximum date range for the provided symbols.")
             st.stop()
         start_date = common_start
         end_date = today
