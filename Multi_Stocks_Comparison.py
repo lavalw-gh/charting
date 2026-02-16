@@ -1,15 +1,13 @@
 from __future__ import annotations
-
 from datetime import date, timedelta
 from io import BytesIO
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-
+#version 2 - added Max Range
 # ----------------------------
 # Parsing / settings helpers
 # ----------------------------
@@ -25,7 +23,6 @@ def parse_ticker_lines(raw: str) -> list[str]:
             seen.add(t)
             out.append(t)
     return out
-
 
 def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tuple[date, date]:
     today = date.today()
@@ -49,12 +46,13 @@ def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tu
         return today - timedelta(days=3653), today
     if preset == "Last 20 yrs":
         return today - timedelta(days=7305), today
+    if preset == "Max":
+        # Will be handled separately - return placeholder
+        return date(1900, 1, 1), today
     return start_custom, end_custom
-
 
 def fmt_d(d: date) -> str:
     return d.strftime("%d/%m/%Y")
-
 
 # ----------------------------
 # Yahoo metadata + currency
@@ -67,26 +65,21 @@ def get_symbol_meta(symbol: str) -> dict:
     """
     t = yf.Ticker(symbol)
     meta = {"symbol": symbol, "currency": None, "name": None}
-
     try:
         meta["currency"] = getattr(t.fastinfo, "currency", None)
     except Exception:
         meta["currency"] = None
-
     if not meta["currency"]:
         try:
             meta["currency"] = (t.info or {}).get("currency", None)
         except Exception:
             meta["currency"] = None
-
     try:
         info = t.info or {}
         meta["name"] = info.get("longName") or info.get("shortName")
     except Exception:
         meta["name"] = None
-
     return meta
-
 
 def currency_factor_to_major_units(yahoo_currency: str | None) -> tuple[float, str]:
     """
@@ -100,7 +93,6 @@ def currency_factor_to_major_units(yahoo_currency: str | None) -> tuple[float, s
     if yahoo_currency:
         return 1.0, f"No conversion applied (Yahoo currency: {yahoo_currency})"
     return 1.0, "Currency unknown (no conversion applied)"
-
 
 # ----------------------------
 # Yahoo download (Close only)
@@ -117,7 +109,6 @@ def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.Da
 
     # yfinance end is often exclusive; add 1 day so UI "end" is effectively inclusive
     end_plus = end + timedelta(days=1)
-
     data = yf.download(
         symbols,
         start=start,
@@ -128,7 +119,6 @@ def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.Da
     )
 
     issues: list[dict] = []
-
     if data is None or getattr(data, "empty", True):
         issues.append({"symbol": ",".join(symbols),
                       "problem": "No data returned for any symbol"})
@@ -164,6 +154,71 @@ def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.Da
     close = close[symbols]  # enforce consistent column order
     return close, issues
 
+# ----------------------------
+# Max date range determination
+# ----------------------------
+
+def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | None]:
+    """
+    Fetch maximum available history for all symbols and find the latest
+    first-valid-date (so all symbols have data from that point forward).
+    Returns (start_date, limiting_symbol)
+    """
+    if not symbols:
+        return None, None
+    
+    # Fetch from a very early date to get all available history
+    early_start = date(1990, 1, 1)
+    today = date.today()
+    end_plus = today + timedelta(days=1)
+    
+    try:
+        data = yf.download(
+            symbols,
+            start=early_start,
+            end=end_plus,
+            auto_adjust=True,
+            progress=False,
+            group_by="column",
+        )
+        
+        if data is None or getattr(data, "empty", True):
+            return None, None
+        
+        # Extract Close prices
+        if isinstance(data.columns, pd.MultiIndex):
+            if "Close" not in data.columns.get_level_values(0):
+                return None, None
+            close = data["Close"].copy()
+        else:
+            if "Close" in data.columns:
+                close = data["Close"].to_frame()
+                close.columns = [symbols[0]]
+            elif "Adj Close" in data.columns:
+                close = data["Adj Close"].to_frame()
+                close.columns = [symbols[0]]
+            else:
+                return None, None
+        
+        # Find first valid date for each symbol
+        first_dates = {}
+        for sym in symbols:
+            if sym in close.columns:
+                first_valid = close[sym].first_valid_index()
+                if first_valid is not None:
+                    first_dates[sym] = pd.to_datetime(first_valid).date()
+        
+        if not first_dates:
+            return None, None
+        
+        # The max (latest) first date is our common start
+        limiting_symbol = max(first_dates, key=first_dates.get)
+        common_start = first_dates[limiting_symbol]
+        
+        return common_start, limiting_symbol
+        
+    except Exception:
+        return None, None
 
 # ----------------------------
 # Missing-history handling
@@ -174,7 +229,6 @@ def backfill_leading_flat(close: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]
     If a symbol has no prices at the requested start but does later,
     fill the leading region with the first valid price so growth is zero
     until real data begins.
-
     Returns: (filled_close, missing_ranges)
     """
     close = close.sort_index().copy()
@@ -215,7 +269,6 @@ def backfill_leading_flat(close: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]
 
     return close, missing_ranges
 
-
 # ----------------------------
 # Spike cleaning
 # ----------------------------
@@ -237,7 +290,6 @@ def clean_daily_spikes_flat(
     for sym in close.columns:
         s = close[sym]
         prev_val = None
-
         for ts in s.index:
             val = s.at[ts]
             if pd.isna(val):
@@ -271,7 +323,6 @@ def clean_daily_spikes_flat(
 
     return close, corrections
 
-
 # ----------------------------
 # Transformations for charting
 # ----------------------------
@@ -287,7 +338,6 @@ def compute_rebased_index(close: pd.DataFrame, base_value: float = 100.0) -> pd.
         return pd.DataFrame()
     return pd.DataFrame(out).sort_index()
 
-
 def compute_cum_return(close: pd.DataFrame) -> pd.DataFrame:
     out = {}
     for c in close.columns:
@@ -298,7 +348,6 @@ def compute_cum_return(close: pd.DataFrame) -> pd.DataFrame:
     if not out:
         return pd.DataFrame()
     return pd.DataFrame(out).sort_index()
-
 
 # ----------------------------
 # Plot + export
@@ -316,7 +365,6 @@ def plot_lines(df: pd.DataFrame, title: str, y_label: str, percent: bool) -> plt
     fig.autofmt_xdate()
     return fig
 
-
 def fig_to_png_bytes(fig: plt.Figure) -> bytes:
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
@@ -324,9 +372,8 @@ def fig_to_png_bytes(fig: plt.Figure) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
-
 # ----------------------------
-# Notes generation (new)
+# Notes generation
 # ----------------------------
 
 def build_notes_lines(
@@ -336,11 +383,19 @@ def build_notes_lines(
     corrections: list[dict],
     spike_threshold_pct: int,
     max_dates_per_symbol: int = 12,
+    max_mode_info: tuple[bool, str | None] = (False, None),
 ) -> list[str]:
     """
     Returns a list of human-readable note lines to display under the chart.
     """
     lines: list[str] = []
+    
+    # Max mode note (if applicable)
+    is_max_mode, limiting_symbol = max_mode_info
+    if is_max_mode and limiting_symbol:
+        lines.append(
+            f"Max date range used: {fmt_d(start_date)} to {fmt_d(end_date)}, which is the maximum range available for {limiting_symbol}."
+        )
 
     # Missing/backfill summary
     if not missing_ranges:
@@ -398,7 +453,6 @@ def build_notes_lines(
 
     return lines
 
-
 # ----------------------------
 # Streamlit App
 # ----------------------------
@@ -408,7 +462,6 @@ st.title("Yahoo! Charts")
 
 with st.sidebar:
     st.header("Tickers")
-
     raw_tickers = st.text_area(
         "Enter tickers (one per line)",
         value="VHYL.L\nCSP1.L\nSGLN.L\nFGQI.L\nJEGI.L",
@@ -417,19 +470,17 @@ with st.sidebar:
     )
 
     st.header("Settings")
-
     benchmark = st.text_input("Benchmark ticker", value="^GSPC")
 
     date_preset = st.selectbox(
         "Date range",
         ["Custom", "Last 3 months", "Last 6 months", "YTD",
-            "Last 12 months", "Last 24 months", "Last 36 months", "Last 5 yrs", "Last 10 yrs", "Last 20 yrs"],
+         "Last 12 months", "Last 24 months", "Last 36 months", "Last 5 yrs", "Last 10 yrs", "Last 20 yrs", "Max"],
         index=4,
     )
 
     today = date.today()
     default_start = today - timedelta(days=365)
-
     start_custom = st.date_input("Start date", value=default_start)
     end_custom = st.date_input("End date", value=today)
 
@@ -448,6 +499,7 @@ with st.sidebar:
         value=True,
         help="If abs(1-day move) exceeds the threshold, replace that day's price with the prior day's price.",
     )
+
     spike_threshold_pct = st.slider(
         "Spike threshold (%)",
         min_value=5,
@@ -461,9 +513,8 @@ with st.sidebar:
 
     run = st.button("Update chart", type="primary")
 
-
 if not run:
-    st.info("Enter tickers on the left, adjust settings, then click “Update chart”.")
+    st.info("Enter tickers on the left, adjust settings, then click "Update chart".")
     st.stop()
 
 tickers = parse_ticker_lines(raw_tickers)
@@ -476,11 +527,24 @@ if not benchmark:
     st.error("Please enter a benchmark ticker.")
     st.stop()
 
+symbols = tickers + [benchmark]
+
+# Handle Max date range
+is_max_mode = (date_preset == "Max")
+limiting_symbol = None
+
+if is_max_mode:
+    with st.spinner("Calculating maximum common date range..."):
+        common_start, limiting_symbol = find_max_common_start_date(symbols)
+        if common_start is None:
+            st.error("Unable to determine maximum date range for the provided symbols.")
+            st.stop()
+        start_date = common_start
+        end_date = today
+
 if end_date <= start_date:
     st.error("End date must be after start date.")
     st.stop()
-
-symbols = tickers + [benchmark]
 
 with st.spinner("Downloading prices from Yahoo..."):
     close_raw, issues = fetch_yahoo_close(symbols, start_date, end_date)
@@ -552,12 +616,12 @@ if show_currency_table:
 # Compute series for plotting
 if chart_mode == "Cumulative return (%)":
     plot_df = compute_cum_return(close_filled)
-    title = f"Cumulative return (rebased to 0) — {start_date} to {end_date}"
+    title = f"Cumulative return — {fmt_d(start_date)} to {fmt_d(end_date)}"
     ylab = "Cumulative return (%)"
     percent = True
 else:
     plot_df = compute_rebased_index(close_filled, base_value=100.0)
-    title = f"Rebased index (start=100) — {start_date} to {end_date}"
+    title = f"Rebased index (start=100) — {fmt_d(start_date)} to {fmt_d(end_date)}"
     ylab = "Index level"
     percent = False
 
@@ -579,7 +643,7 @@ st.download_button(
     mime="image/png",
 )
 
-# Notes below chart (new)
+# Notes below chart
 st.subheader("Notes / data quality")
 notes = build_notes_lines(
     start_date=start_date,
@@ -588,8 +652,8 @@ notes = build_notes_lines(
     corrections=corrections,
     spike_threshold_pct=spike_threshold_pct,
     max_dates_per_symbol=12,
+    max_mode_info=(is_max_mode, limiting_symbol),
 )
+
 for line in notes:
     st.write(f"- {line}")
-
-
