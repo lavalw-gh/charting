@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# version 2 - max date range
+# version 2 - max date range + extreme spikes fix
 # ----------------------------
 # Parsing / settings helpers
 # ----------------------------
@@ -820,3 +820,4 @@ notes = build_notes_lines(
 
 for line in notes:
     st.write(f"- {line}")
+
