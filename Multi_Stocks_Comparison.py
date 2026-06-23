@@ -681,9 +681,9 @@ with st.sidebar:
     st.header("Tickers")
     raw_tickers = st.text_area(
         "Enter tickers (one per line)",
-        value="VHYL.L\nCSP1.L\nSGLN.L\nFGQI.L\nJEGI.L",
+        value="VHYL.L\nVUAG.L\nSWDA.L\nCEA1.L\nIEFV.L\nSGLN.L",
         height=160,
-        help="Example: VHYL.L, CSP1.L, SGLN.L, FGQI.L, JEGI.L",
+        help="Example: VHYL.L, VUAG.L, SWDA.L, CEA1.L, IEFV.L, SGLN.L",
     )
 
     st.header("Settings")
