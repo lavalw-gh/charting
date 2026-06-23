@@ -1,6 +1,8 @@
 from __future__ import annotations
 from datetime import date, timedelta
+from html import escape
 from io import BytesIO
+from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -16,13 +18,18 @@ import yfinance as yf
 def parse_ticker_lines(raw: str) -> list[str]:
     lines = [ln.strip() for ln in (raw or "").splitlines()]
     tickers = [t for t in lines if t]
-    # de-dupe, preserve order
+    return dedupe_symbols(tickers)
+
+
+def dedupe_symbols(symbols: list[str]) -> list[str]:
+    """De-dupe symbols case-insensitively while preserving the first spelling."""
     seen = set()
     out = []
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+    for symbol in symbols:
+        key = symbol.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(symbol)
     return out
 
 
@@ -30,27 +37,23 @@ def resolve_date_preset(preset: str, start_custom: date, end_custom: date) -> tu
     today = date.today()
     if preset == "Custom":
         return start_custom, end_custom
-    if preset == "Last 3 months":
-        return today - timedelta(days=90), today
-    if preset == "Last 6 months":
-        return today - timedelta(days=180), today
     if preset == "YTD":
         return date(today.year, 1, 1), today
-    if preset == "Last 12 months":
-        return today - timedelta(days=365), today
-    if preset == "Last 24 months":
-        return today - timedelta(days=730), today
-    if preset == "Last 36 months":
-        return today - timedelta(days=1095), today
-    if preset == "Last 5 yrs":
-        return today - timedelta(days=1826), today
-    if preset == "Last 10 yrs":
-        return today - timedelta(days=3653), today
-    if preset == "Last 20 yrs":
-        return today - timedelta(days=7305), today
     if preset == "Max":
         # Will be handled separately - return placeholder
         return date(1900, 1, 1), today
+    preset_days = {
+        "Last 3 months": 90,
+        "Last 6 months": 180,
+        "Last 12 months": 365,
+        "Last 24 months": 730,
+        "Last 36 months": 1095,
+        "Last 5 yrs": 1826,
+        "Last 10 yrs": 3653,
+        "Last 20 yrs": 7305,
+    }
+    if preset in preset_days:
+        return today - timedelta(days=preset_days[preset]), today
     return start_custom, end_custom
 
 
@@ -69,20 +72,18 @@ def get_symbol_meta(symbol: str) -> dict:
     """
     t = yf.Ticker(symbol)
     meta = {"symbol": symbol, "currency": None, "name": None}
+    info = {}
     try:
         meta["currency"] = getattr(t.fastinfo, "currency", None)
     except Exception:
         meta["currency"] = None
-    if not meta["currency"]:
-        try:
-            meta["currency"] = (t.info or {}).get("currency", None)
-        except Exception:
-            meta["currency"] = None
     try:
         info = t.info or {}
-        meta["name"] = info.get("longName") or info.get("shortName")
     except Exception:
-        meta["name"] = None
+        info = {}
+    if not meta["currency"]:
+        meta["currency"] = info.get("currency", None)
+    meta["name"] = info.get("longName") or info.get("shortName")
     return meta
 
 
@@ -99,6 +100,50 @@ def currency_factor_to_major_units(yahoo_currency: str | None) -> tuple[float, s
         return 1.0, f"No conversion applied (Yahoo currency: {yahoo_currency})"
     return 1.0, "Currency unknown (no conversion applied)"
 
+
+def extract_close_from_yahoo_data(
+    data: pd.DataFrame | None,
+    symbols: list[str],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Extract Close prices from yfinance output and return missing-symbol issues.
+    """
+    issues: list[dict] = []
+    if data is None or getattr(data, "empty", True):
+        return pd.DataFrame(), [{"symbol": ",".join(symbols), "problem": "No data returned for any symbol"}]
+
+    if isinstance(data.columns, pd.MultiIndex):
+        if "Close" in data.columns.get_level_values(0):
+            close = data["Close"].copy()
+        elif "Adj Close" in data.columns.get_level_values(0):
+            close = data["Adj Close"].copy()
+        else:
+            return pd.DataFrame(), [{
+                "symbol": ",".join(symbols),
+                "problem": "Expected Close or Adj Close in yfinance output but not found",
+            }]
+    else:
+        if "Close" in data.columns:
+            close = data["Close"].to_frame()
+            close.columns = [symbols[0]]
+        elif "Adj Close" in data.columns:
+            close = data["Adj Close"].to_frame()
+            close.columns = [symbols[0]]
+        else:
+            return pd.DataFrame(), [{
+                "symbol": symbols[0] if symbols else "",
+                "problem": "Neither Close nor Adj Close found in yfinance output",
+            }]
+
+    for symbol in symbols:
+        if symbol not in close.columns:
+            close[symbol] = np.nan
+            issues.append({
+                "symbol": symbol,
+                "problem": "Symbol missing from Yahoo download (column added as all-NaN)",
+            })
+
+    return close.sort_index()[symbols], issues
 
 
 def fix_gbp_unit_mix_extremes(
@@ -207,6 +252,24 @@ def fix_gbp_unit_mix_extremes(
                         })
 
     return fixed, report
+
+
+def find_max_common_start_from_close(close: pd.DataFrame, symbols: list[str]) -> tuple[date | None, str | None]:
+    """
+    Find the latest first-valid date across symbols, so all have data from that point.
+    """
+    first_dates = {}
+    for symbol in symbols:
+        if symbol in close.columns:
+            first_valid = close[symbol].first_valid_index()
+            if first_valid is not None:
+                first_dates[symbol] = pd.to_datetime(first_valid).date()
+
+    if not first_dates:
+        return None, None
+
+    limiting_symbol = max(first_dates, key=first_dates.get)
+    return first_dates[limiting_symbol], limiting_symbol
 # ----------------------------
 # Yahoo download (Close only)
 # ----------------------------
@@ -223,64 +286,36 @@ def fetch_yahoo_close(symbols: list[str], start: date, end: date) -> tuple[pd.Da
 
     # yfinance end is often exclusive; add 1 day so UI "end" is effectively inclusive
     end_plus = end + timedelta(days=1)
-    data = yf.download(
-        symbols,
-        start=start,
-        end=end_plus,
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-    )
+    try:
+        data = yf.download(
+            symbols,
+            start=start,
+            end=end_plus,
+            auto_adjust=True,
+            progress=False,
+            group_by="column",
+        )
+    except Exception as exc:
+        return pd.DataFrame(), [{
+            "symbol": ",".join(symbols),
+            "problem": f"Yahoo download failed: {exc}",
+        }]
 
-    issues: list[dict] = []
-    if data is None or getattr(data, "empty", True):
-        issues.append({"symbol": ",".join(symbols),
-                      "problem": "No data returned for any symbol"})
-        return pd.DataFrame(), issues
-
-    # MultiIndex for multiple symbols; single-index for one symbol
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Close" not in data.columns.get_level_values(0):
-            issues.append({"symbol": ",".join(
-                symbols), "problem": "Expected Close in yfinance output but not found"})
-            return pd.DataFrame(), issues
-        close = data["Close"].copy()
-    else:
-        if "Close" in data.columns:
-            close = data["Close"].to_frame()
-            close.columns = [symbols[0]]
-        elif "Adj Close" in data.columns:
-            close = data["Adj Close"].to_frame()
-            close.columns = [symbols[0]]
-        else:
-            issues.append(
-                {"symbol": symbols[0], "problem": "Neither Close nor Adj Close found in yfinance output"})
-            return pd.DataFrame(), issues
-
-    # Ensure all requested symbols exist as columns (if missing, add all-NaN)
-    for s in symbols:
-        if s not in close.columns:
-            close[s] = np.nan
-            issues.append(
-                {"symbol": s, "problem": "Symbol missing from Yahoo download (column added as all-NaN)"})
-
-    close = close.sort_index()
-    close = close[symbols]  # enforce consistent column order
-    return close, issues
+    return extract_close_from_yahoo_data(data, symbols)
 
 # ----------------------------
 # Max date range determination
 # ----------------------------
 
 
-def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | None]:
+def fetch_max_common_close(symbols: list[str]) -> tuple[pd.DataFrame, date | None, str | None, list[dict]]:
     """
     Fetch maximum available history for all symbols and find the latest
     first-valid-date (so all symbols have data from that point forward).
-    Returns (start_date, limiting_symbol)
+    Returns (close_df, start_date, limiting_symbol, issues)
     """
     if not symbols:
-        return None, None
+        return pd.DataFrame(), None, None, [{"symbol": "", "problem": "No symbols provided"}]
 
     # Fetch from a very early date to get all available history
     early_start = date(1990, 1, 1)
@@ -297,43 +332,18 @@ def find_max_common_start_date(symbols: list[str]) -> tuple[date | None, str | N
             group_by="column",
         )
 
-        if data is None or getattr(data, "empty", True):
-            return None, None
+        close, issues = extract_close_from_yahoo_data(data, symbols)
+        if close.empty:
+            return pd.DataFrame(), None, None, issues
 
-        # Extract Close prices
-        if isinstance(data.columns, pd.MultiIndex):
-            if "Close" not in data.columns.get_level_values(0):
-                return None, None
-            close = data["Close"].copy()
-        else:
-            if "Close" in data.columns:
-                close = data["Close"].to_frame()
-                close.columns = [symbols[0]]
-            elif "Adj Close" in data.columns:
-                close = data["Adj Close"].to_frame()
-                close.columns = [symbols[0]]
-            else:
-                return None, None
+        common_start, limiting_symbol = find_max_common_start_from_close(close, symbols)
+        return close, common_start, limiting_symbol, issues
 
-        # Find first valid date for each symbol
-        first_dates = {}
-        for sym in symbols:
-            if sym in close.columns:
-                first_valid = close[sym].first_valid_index()
-                if first_valid is not None:
-                    first_dates[sym] = pd.to_datetime(first_valid).date()
-
-        if not first_dates:
-            return None, None
-
-        # The max (latest) first date is our common start
-        limiting_symbol = max(first_dates, key=first_dates.get)
-        common_start = first_dates[limiting_symbol]
-
-        return common_start, limiting_symbol
-
-    except Exception:
-        return None, None
+    except Exception as exc:
+        return pd.DataFrame(), None, None, [{
+            "symbol": ",".join(symbols),
+            "problem": f"Yahoo download failed: {exc}",
+        }]
 
 # ----------------------------
 # Missing-history handling
@@ -446,24 +456,25 @@ def clean_daily_spikes_flat(
 
 
 def compute_rebased_index(close: pd.DataFrame, base_value: float = 100.0) -> pd.DataFrame:
-    out = {}
-    for c in close.columns:
-        s = close[c].dropna()
-        if s.empty:
-            continue
-        out[c] = (s / s.iloc[0]) * base_value
-    if not out:
-        return pd.DataFrame()
-    return pd.DataFrame(out).sort_index()
+    return compute_scaled_from_first_price(close, multiplier=base_value, subtract_one=False)
 
 
 def compute_cum_return(close: pd.DataFrame) -> pd.DataFrame:
+    return compute_scaled_from_first_price(close, multiplier=1.0, subtract_one=True)
+
+
+def compute_scaled_from_first_price(
+    close: pd.DataFrame,
+    multiplier: float,
+    subtract_one: bool,
+) -> pd.DataFrame:
     out = {}
-    for c in close.columns:
-        s = close[c].dropna()
+    for column in close.columns:
+        s = close[column].dropna()
         if s.empty:
             continue
-        out[c] = (s / s.iloc[0]) - 1.0
+        scaled = s / s.iloc[0]
+        out[column] = (scaled - 1.0) * multiplier if subtract_one else scaled * multiplier
     if not out:
         return pd.DataFrame()
     return pd.DataFrame(out).sort_index()
@@ -492,6 +503,67 @@ def fig_to_png_bytes(fig: plt.Figure) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+def safe_sheet_name(symbol: str, existing: set[str]) -> str:
+    cleaned = "".join("_" if ch in r'[]:*?/\\' else ch for ch in symbol).strip("'") or "Sheet"
+    base = cleaned[:31]
+    sheet_name = base
+    counter = 2
+    while sheet_name in existing:
+        suffix = f"_{counter}"
+        sheet_name = f"{base[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    existing.add(sheet_name)
+    return sheet_name
+
+
+def export_prices_to_xls(prices: pd.DataFrame, output_path: str) -> None:
+    """
+    Write one worksheet per symbol as Excel-compatible XML using an .xls extension.
+    This avoids adding a dependency just to create a simple multi-sheet workbook.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    sheets = []
+    existing_names: set[str] = set()
+    for symbol in prices.columns:
+        sheet_name = safe_sheet_name(str(symbol), existing_names)
+        rows = [
+            "    <Row>"
+            "<Cell><Data ss:Type=\"String\">Date</Data></Cell>"
+            "<Cell><Data ss:Type=\"String\">Price</Data></Cell>"
+            "</Row>"
+        ]
+        series = prices[symbol].dropna()
+        for ts, value in series.items():
+            dt = pd.to_datetime(ts).strftime("%Y-%m-%d")
+            rows.append(
+                "    <Row>"
+                f"<Cell><Data ss:Type=\"String\">{escape(dt)}</Data></Cell>"
+                f"<Cell><Data ss:Type=\"Number\">{float(value):.10g}</Data></Cell>"
+                "</Row>"
+            )
+        sheets.append(
+            f"  <Worksheet ss:Name=\"{escape(sheet_name)}\">\n"
+            "   <Table>\n"
+            + "\n".join(rows)
+            + "\n   </Table>\n"
+            "  </Worksheet>"
+        )
+
+    workbook = (
+        "<?xml version=\"1.0\"?>\n"
+        "<?mso-application progid=\"Excel.Sheet\"?>\n"
+        "<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"\n"
+        " xmlns:o=\"urn:schemas-microsoft-com:office:office\"\n"
+        " xmlns:x=\"urn:schemas-microsoft-com:office:excel\"\n"
+        " xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">\n"
+        + "\n".join(sheets)
+        + "\n</Workbook>\n"
+    )
+    path.write_text(workbook, encoding="utf-8")
 
 # ----------------------------
 # Notes generation
@@ -557,7 +629,7 @@ def build_notes_lines(
             f"No spike flattening was applied (threshold {spike_threshold_pct}% daily move).")
     else:
         lines.append(
-            f"Possible data-quality spikes were flattened when the 1-day move exceeded {spike_threshold_pct}% (today's price replaced with yesterday's)."
+            f"User-selected spike cleaning flattened possible data-quality spikes when the 1-day move exceeded {spike_threshold_pct}% (today's price replaced with yesterday's)."
         )
 
         by_sym: dict[str, list[date]] = {}
@@ -580,13 +652,13 @@ def build_notes_lines(
     report = gbp_unit_mix_report or []
     if report:
         lines.append(
-            f"GBp/GBP unit-mix extremes were detected and corrected for {len(report)} data points (×100 adjustment)."
+            f"GBp/GBP unit-mix extremes were detected and corrected for {len(report)} data points (x100 adjustment)."
         )
         by_sym: dict[str, list[date]] = {}
         for r in report:
             sym = r.get("Ticker", "")
             dt = pd.to_datetime(r.get("Date", ""), errors="coerce")
-            if not sym or dt is pd.NaT:
+            if not sym or pd.isna(dt):
                 continue
             by_sym.setdefault(sym, []).append(dt.date())
         for sym in sorted(by_sym.keys()):
@@ -656,9 +728,13 @@ with st.sidebar:
     show_currency_table = st.checkbox(
         "Show currency / pence-pound handling", value=False)
 
-    run = st.button("Update chart", type="primary")
+    button_cols = st.columns(2)
+    with button_cols[0]:
+        run = st.button("Update chart", type="primary")
+    with button_cols[1]:
+        export_requested = st.button("Export csv")
 
-if not run:
+if not (run or export_requested):
     st.info('Enter tickers on the left, adjust settings, then click "Update chart".')
     st.stop()
 
@@ -672,28 +748,33 @@ if not benchmark:
     st.error("Please enter a benchmark ticker.")
     st.stop()
 
-symbols = tickers + [benchmark]
+tickers = [t for t in tickers if t.casefold() != benchmark.casefold()]
+symbols = dedupe_symbols(tickers + [benchmark])
 
 # Handle Max date range
 is_max_mode = (date_preset == "Max")
 limiting_symbol = None
+close_raw = pd.DataFrame()
+issues: list[dict] = []
 
 if is_max_mode:
-    with st.spinner("Calculating maximum common date range..."):
-        common_start, limiting_symbol = find_max_common_start_date(symbols)
+    with st.spinner("Calculating maximum common date range and downloading prices..."):
+        max_close, common_start, limiting_symbol, issues = fetch_max_common_close(symbols)
         if common_start is None:
             st.error(
                 "Unable to determine maximum date range for the provided symbols.")
             st.stop()
         start_date = common_start
         end_date = today
+        close_raw = max_close.loc[max_close.index >= pd.Timestamp(start_date)].copy()
 
 if end_date <= start_date:
     st.error("End date must be after start date.")
     st.stop()
 
-with st.spinner("Downloading prices from Yahoo..."):
-    close_raw, issues = fetch_yahoo_close(symbols, start_date, end_date)
+if close_raw.empty:
+    with st.spinner("Downloading prices from Yahoo..."):
+        close_raw, issues = fetch_yahoo_close(symbols, start_date, end_date)
 
 if close_raw.empty:
     st.error("No price data returned.")
@@ -778,18 +859,26 @@ if show_currency_table:
 # Compute series for plotting
 if chart_mode == "Cumulative return (%)":
     plot_df = compute_cum_return(close_filled)
-    title = f"Cumulative return — {fmt_d(start_date)} to {fmt_d(end_date)}"
+    title = f"Cumulative return - {fmt_d(start_date)} to {fmt_d(end_date)}"
     ylab = "Cumulative return (%)"
     percent = True
 else:
     plot_df = compute_rebased_index(close_filled, base_value=100.0)
-    title = f"Rebased index (start=100) — {fmt_d(start_date)} to {fmt_d(end_date)}"
+    title = f"Rebased index (start=100) - {fmt_d(start_date)} to {fmt_d(end_date)}"
     ylab = "Index level"
     percent = False
 
 if plot_df.empty or plot_df.shape[1] < 2:
     st.error("Not enough data to plot (need at least one ticker plus the benchmark).")
     st.stop()
+
+if export_requested:
+    export_path = r"C:\temp\yahoo-charts_data.xls"
+    try:
+        export_prices_to_xls(close_filled, export_path)
+        st.success(f"Exported chart price data to {export_path}")
+    except Exception as exc:
+        st.error(f"Export failed: {exc}")
 
 # Rename benchmark label for clarity
 plot_df = plot_df.rename(columns={benchmark: f"Benchmark: {benchmark}"})
