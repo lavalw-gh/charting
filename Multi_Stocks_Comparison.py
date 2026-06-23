@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from html import escape
 from io import BytesIO
+from zipfile import ZIP_DEFLATED, ZipFile
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -517,49 +518,104 @@ def safe_sheet_name(symbol: str, existing: set[str]) -> str:
     return sheet_name
 
 
-def export_prices_to_xls_bytes(prices: pd.DataFrame) -> bytes:
+def export_prices_to_xlsx_bytes(prices: pd.DataFrame) -> bytes:
     """
-    Build one worksheet per symbol as Excel-compatible XML using an .xls extension.
-    This avoids adding a dependency just to create a simple multi-sheet workbook.
+    Build one worksheet per symbol as a real .xlsx workbook.
+    Each worksheet has columns: Name, Date, Price.
     """
-    sheets = []
+    output = BytesIO()
+    sheet_entries = []
     existing_names: set[str] = set()
-    for symbol in prices.columns:
-        sheet_name = safe_sheet_name(str(symbol), existing_names)
-        rows = [
-            "    <Row>"
-            "<Cell><Data ss:Type=\"String\">Date</Data></Cell>"
-            "<Cell><Data ss:Type=\"String\">Price</Data></Cell>"
-            "</Row>"
-        ]
-        series = prices[symbol].dropna()
-        for ts, value in series.items():
-            dt = pd.to_datetime(ts).strftime("%Y-%m-%d")
-            rows.append(
-                "    <Row>"
-                f"<Cell><Data ss:Type=\"String\">{escape(dt)}</Data></Cell>"
-                f"<Cell><Data ss:Type=\"Number\">{float(value):.10g}</Data></Cell>"
-                "</Row>"
-            )
-        sheets.append(
-            f"  <Worksheet ss:Name=\"{escape(sheet_name)}\">\n"
-            "   <Table>\n"
-            + "\n".join(rows)
-            + "\n   </Table>\n"
-            "  </Worksheet>"
+
+    with ZipFile(output, "w", ZIP_DEFLATED) as workbook_zip:
+        workbook_zip.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+""" + "".join(
+                f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\n'
+                for i, _ in enumerate(prices.columns, start=1)
+            ) + "</Types>",
+        )
+        workbook_zip.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        )
+        workbook_zip.writestr(
+            "xl/styles.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+<fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>""",
         )
 
-    workbook = (
-        "<?xml version=\"1.0\"?>\n"
-        "<?mso-application progid=\"Excel.Sheet\"?>\n"
-        "<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"\n"
-        " xmlns:o=\"urn:schemas-microsoft-com:office:office\"\n"
-        " xmlns:x=\"urn:schemas-microsoft-com:office:excel\"\n"
-        " xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">\n"
-        + "\n".join(sheets)
-        + "\n</Workbook>\n"
-    )
-    return workbook.encode("utf-8")
+        for sheet_id, symbol in enumerate(prices.columns, start=1):
+            sheet_name = safe_sheet_name(str(symbol), existing_names)
+            sheet_entries.append((sheet_id, sheet_name))
+            rows = [
+                '<row r="1">'
+                '<c r="A1" t="inlineStr"><is><t>Name</t></is></c>'
+                '<c r="B1" t="inlineStr"><is><t>Date</t></is></c>'
+                '<c r="C1" t="inlineStr"><is><t>Price</t></is></c>'
+                "</row>"
+            ]
+            series = prices[symbol].dropna()
+            for row_number, (ts, value) in enumerate(series.items(), start=2):
+                dt = pd.to_datetime(ts).strftime("%Y-%m-%d")
+                rows.append(
+                    f'<row r="{row_number}">'
+                    f'<c r="A{row_number}" t="inlineStr"><is><t>{escape(str(symbol))}</t></is></c>'
+                    f'<c r="B{row_number}" t="inlineStr"><is><t>{escape(dt)}</t></is></c>'
+                    f'<c r="C{row_number}"><v>{float(value):.10g}</v></c>'
+                    "</row>"
+                )
+            workbook_zip.writestr(
+                f"xl/worksheets/sheet{sheet_id}.xml",
+                """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetViews><sheetView workbookViewId="0"/></sheetViews>
+<sheetFormatPr defaultRowHeight="15"/>
+<cols><col min="1" max="1" width="16" customWidth="1"/><col min="2" max="2" width="14" customWidth="1"/><col min="3" max="3" width="14" customWidth="1"/></cols>
+<sheetData>
+""" + "\n".join(rows) + """
+</sheetData>
+</worksheet>""",
+            )
+
+        workbook_zip.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets>
+""" + "".join(
+                f'<sheet name="{escape(sheet_name)}" sheetId="{sheet_id}" r:id="rId{sheet_id}"/>\n'
+                for sheet_id, sheet_name in sheet_entries
+            ) + """</sheets>
+</workbook>""",
+        )
+        workbook_zip.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+""" + "".join(
+                f'<Relationship Id="rId{sheet_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_id}.xml"/>\n'
+                for sheet_id, _ in sheet_entries
+            ) + "</Relationships>",
+        )
+
+    return output.getvalue()
 
 # ----------------------------
 # Notes generation
@@ -728,7 +784,7 @@ with st.sidebar:
     with button_cols[0]:
         run = st.button("Update chart", type="primary")
     with button_cols[1]:
-        export_requested = st.button("Export csv")
+        export_requested = st.button("Export data")
 
 if not (run or export_requested):
     st.info('Enter tickers on the left, adjust settings, then click "Update chart".')
@@ -870,12 +926,12 @@ if plot_df.empty or plot_df.shape[1] < 2:
 
 if export_requested:
     try:
-        export_bytes = export_prices_to_xls_bytes(close_filled)
+        export_bytes = export_prices_to_xlsx_bytes(close_filled)
         st.download_button(
-            "Download yahoo-charts_data.xls",
+            "Download yahoo-charts_data.xlsx",
             data=export_bytes,
-            file_name="yahoo-charts_data.xls",
-            mime="application/vnd.ms-excel",
+            file_name="yahoo-charts_data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         st.info("Your browser will download the file to your computer. Save or move it to C:\\temp if that is where you want it stored.")
     except Exception as exc:
