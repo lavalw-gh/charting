@@ -2,7 +2,6 @@ from __future__ import annotations
 from datetime import date, timedelta
 from html import escape
 from io import BytesIO
-from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -518,14 +517,11 @@ def safe_sheet_name(symbol: str, existing: set[str]) -> str:
     return sheet_name
 
 
-def export_prices_to_xls(prices: pd.DataFrame, output_path: str) -> None:
+def export_prices_to_xls_bytes(prices: pd.DataFrame) -> bytes:
     """
-    Write one worksheet per symbol as Excel-compatible XML using an .xls extension.
+    Build one worksheet per symbol as Excel-compatible XML using an .xls extension.
     This avoids adding a dependency just to create a simple multi-sheet workbook.
     """
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     sheets = []
     existing_names: set[str] = set()
     for symbol in prices.columns:
@@ -563,7 +559,7 @@ def export_prices_to_xls(prices: pd.DataFrame, output_path: str) -> None:
         + "\n".join(sheets)
         + "\n</Workbook>\n"
     )
-    path.write_text(workbook, encoding="utf-8")
+    return workbook.encode("utf-8")
 
 # ----------------------------
 # Notes generation
@@ -873,10 +869,15 @@ if plot_df.empty or plot_df.shape[1] < 2:
     st.stop()
 
 if export_requested:
-    export_path = r"C:\temp\yahoo-charts_data.xls"
     try:
-        export_prices_to_xls(close_filled, export_path)
-        st.success(f"Exported chart price data to {export_path}")
+        export_bytes = export_prices_to_xls_bytes(close_filled)
+        st.download_button(
+            "Download yahoo-charts_data.xls",
+            data=export_bytes,
+            file_name="yahoo-charts_data.xls",
+            mime="application/vnd.ms-excel",
+        )
+        st.info("Your browser will download the file to your computer. Save or move it to C:\\temp if that is where you want it stored.")
     except Exception as exc:
         st.error(f"Export failed: {exc}")
 
