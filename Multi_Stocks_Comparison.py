@@ -488,7 +488,10 @@ def plot_lines(df: pd.DataFrame, title: str, y_label: str, percent: bool) -> plt
     fig, ax = plt.subplots(figsize=(11, 5.5))
     for col in df.columns:
         y = df[col] * 100.0 if percent else df[col]
-        ax.plot(df.index, y, label=col, linewidth=1.6)
+        if str(col).startswith("Benchmark: "):
+            ax.plot(df.index, y, label=col, linewidth=2.2, linestyle=":", color="darkblue")
+        else:
+            ax.plot(df.index, y, label=col, linewidth=1.6)
     ax.set_title(title)
     ax.set_ylabel(y_label)
     ax.grid(True, alpha=0.25)
